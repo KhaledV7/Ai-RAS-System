@@ -142,7 +142,9 @@ def inject_css():
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
     .stApp {{ background: radial-gradient(1200px 600px at 72% -12%, #0c2230 0%, {C_BG} 55%); }}
-    .block-container {{ padding-top: 1.4rem; max-width: 1180px; }}
+    header[data-testid="stHeader"] {{ background: transparent; height: 0; }}
+    [data-testid="stToolbar"] {{ right: 1rem; }}
+    .block-container {{ padding-top: 2.6rem; max-width: 1180px; }}
     html, body, [class*="css"] {{ font-family:'Inter',sans-serif; color:{C_INK}; }}
     h1,h2,h3,h4 {{ font-family:'Sora',sans-serif; letter-spacing:-.01em; }}
 
@@ -406,9 +408,10 @@ def tab_live(feed, obs, clf):
         elif state == "COOLDOWN":
             banner_ph.markdown(banner_html(last_event), unsafe_allow_html=True)
             time.sleep(pace)
-        else:                                                   # MONITOR / SUSPECT -> k blank
+        else:                                                   # MONITOR / SUSPECT -> k blank, no curve
             banner_ph.markdown(banner_html(None), unsafe_allow_html=True)
             thermal_head_ph.markdown(thermal_idle_html(), unsafe_allow_html=True)
+            thermal_chart_ph.empty()
             time.sleep(pace)
 
         progress.progress((i + 1) / len(feed))
@@ -420,38 +423,47 @@ def tab_live(feed, obs, clf):
 # --------------------------------------------------------------------------- #
 # TAB 2 - manual test console
 # --------------------------------------------------------------------------- #
-def tab_manual(clf):
-    st.caption("Enter any water values and the agent will diagnose them and run a thermal "
-               "interrogation on the spot. Use it to probe edge cases.")
+def tab_manual(obs, clf):
+    st.caption("Enter one reading. The agent treats it like a moment of telemetry: if it looks "
+               "abnormal it interrogates the probe and shows the curve + k; if it looks fine it stays quiet.")
     a, b, c, d = st.columns(4)
     do  = a.number_input("Dissolved O\u2082 (mg/L)", 0.0, 20.0, 6.10, 0.1)
     ph  = b.number_input("pH", 0.0, 14.0, 7.70, 0.1)
     nh4 = c.number_input("Ammonia NH\u2084 (mg/L)", 0.0, 50.0, 1.00, 0.1)
     temp = d.number_input("Temp (\u00b0C)", 0.0, 45.0, 26.8, 0.1)
 
-    probe = st.radio("Probe condition (what the thermal pulse would find)",
-                     ["Clean probe (sheds heat fast)", "Fouled probe (traps heat)"], horizontal=True)
-    st.caption("In the deployed product the pulse measures this automatically off a real sonde; "
-               "offline you state it so you can test the key insight.")
+    probe = st.radio("If the agent interrogates, assume the probe is:",
+                     ["Clean (sheds heat fast)", "Fouled (traps heat)"], horizontal=True)
+    st.caption("Offline there is no real sonde, so you state what the pulse would find. With a real "
+               "sonde wired in, the pulse measures this automatically and this control disappears.")
 
-    run = st.button("Run diagnostic", use_container_width=False)
+    run = st.button("Run reading")
 
-    out = st.empty()
     if run:
-        k = 0.85 if probe.startswith("Clean") else 0.12
         row = {"TIME": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
                "DO": do, "pH": ph, "NH4_N": nh4, "Temp": temp}
-        ev = evaluate(row, k, clf)
-        eng.log_decision(row, ev["k_est"], ev["final"], ev["conf"])
-
         st.markdown(cards_html(row), unsafe_allow_html=True)
-        st.markdown(banner_html(ev), unsafe_allow_html=True)
-        g1, g2 = st.columns([1.3, 1])
-        with g1:
-            st.altair_chart(thermal_chart(ev["curve"], ev["severity"]), use_container_width=True)
-            st.caption("30-second cooling curve from the interrogation pulse.")
-        with g2:
-            st.markdown(thermal_result_html(ev), unsafe_allow_html=True)
+
+        # detection: statistically off the learned normal OR breaks a SAMAQ limit
+        level_off = any(abs(row[p] - obs.base_mean[p]) / obs.base_std[p] > obs.sigma
+                        for p in eng.FEATURE_COLS)
+        viol = eng.diagnose_water(row)[0]
+
+        if not (level_off or viol):
+            st.markdown(banner_html(None), unsafe_allow_html=True)
+            st.info("Reading looks normal \u2014 the agent did not interrogate the probe. "
+                    "k is only measured when something looks wrong.")
+        else:
+            k = 0.85 if probe.startswith("Clean") else 0.12
+            ev = evaluate(row, k, clf)
+            eng.log_decision(row, ev["k_est"], ev["final"], ev["conf"])
+            st.markdown(banner_html(ev), unsafe_allow_html=True)
+            g1, g2 = st.columns([1.3, 1])
+            with g1:
+                st.altair_chart(thermal_chart(ev["curve"], ev["severity"]), use_container_width=True)
+                st.caption("30-second cooling curve from the interrogation pulse.")
+            with g2:
+                st.markdown(thermal_result_html(ev), unsafe_allow_html=True)
 
     st.markdown("##### Offline decision log  \u00b7  edge_telemetry.db")
     try:
@@ -479,7 +491,7 @@ def main():
     with live:
         tab_live(feed, obs, clf)
     with manual:
-        tab_manual(clf)
+        tab_manual(obs, clf)
 
 
 if __name__ == "__main__":
