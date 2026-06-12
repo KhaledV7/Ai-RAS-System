@@ -1,28 +1,29 @@
 """
-RAS SENTINEL - app.py  (STEP 3: The Live Dashboard)
-===================================================
-The screen the judges watch. It wraps the EXACT agent loop already verified in
-run_pipeline.py and gives it a face:
+RAS SENTINEL - app.py  (Operations Console)
+===========================================
+A production-style edge console for a single RAS tank, not a scenario tester.
 
-    MONITOR -> SUSPECT -> INTERROGATE -> VERDICT -> (SUPPRESS / ESCALATE) -> LOG
+Two tabs:
+  * LIVE MONITOR     - one continuous farm feed (1 reading = 1 minute, on a farm clock).
+                       The agent runs MONITOR -> SUSPECT -> INTERROGATE -> VERDICT live.
+  * MANUAL TEST      - type ANY water values + pick the probe condition, and the agent
+                       diagnoses + interrogates them on the spot. This is the "what-if".
 
-The memorable moment: on the same "low reading" symptom, the verdict banner flips
-GREEN (clear) / AMBER (hardware fault, alarm suppressed) / RED (real crisis) based on
-the physical thermal evidence -- not on a naive threshold.
+Honest design notes kept visible:
+  * The thermal layer is SIMULATION / DIGITAL-TWIN (field calibration pending).
+  * In the real product the thermal pulse MEASURES the probe (k). Offline there is no
+    probe, so the Manual tab lets you state the probe condition (clean / fouled); when a
+    real sonde is wired in, that control disappears and the pulse fills in k by itself.
 
-Run it locally:
+Run locally:
     pip install streamlit altair pandas numpy scikit-learn
     streamlit run app.py
-(keep this file next to ras_sentinel_engine.py and the two scenario CSVs)
-
-Honesty notes kept visible in the UI:
-  * The thermal layer is SIMULATION / DIGITAL-TWIN mode (field calibration pending).
-  * is_injected is used ONLY to pace the playback (skip calm baseline). The agent never
-    sees it -- it decides purely from the readings, exactly as in run_pipeline.py.
+Keep this file next to ras_sentinel_engine.py.
 """
 
 import time
 import sqlite3
+import datetime as dt
 
 import numpy as np
 import pandas as pd
@@ -32,176 +33,186 @@ import streamlit as st
 import ras_sentinel_engine as eng
 
 # --------------------------------------------------------------------------- #
-# Loop constants -- identical to run_pipeline.py so behaviour matches exactly
+# Tunables
 # --------------------------------------------------------------------------- #
-WINDOW = 10          # trailing rows needed to compute slope features
-COOLDOWN = 250       # readings to wait after a verdict before interrogating again
+WINDOW = 10            # trailing rows for slope features (matches the engine)
+COOLDOWN_LIVE = 14     # readings to wait after a verdict before re-interrogating
+TRAIN_ROWS = 100       # calm rows the Observer learns "normal" from
+FARM = "Hail RAS Facility"
+TANK = "Tank A-03  ·  Nile tilapia"
 
-SCENARIOS = {
-    "Sensor fouling  (false alarm expected)": "sensor_baseline_fail.csv",
-    "Pool crisis  (real crisis expected)":    "pool_crisis.csv",
-}
-
-# Palette -- "deep tank / control room", grounded in the subject (water + oxygen)
-C_BG      = "#081019"
-C_PANEL   = "#0e1d28"
-C_LINE    = "#1d3645"
-C_INK     = "#eaf4f4"
-C_MUTED   = "#7d97a3"
-C_OXY     = "#2bd4c0"   # oxygen cyan  -> DO / healthy / clean
-C_VIOLET  = "#9b8cff"   # pH series
-C_AMBER   = "#f5b13d"   # hardware fault / maintenance
-C_CRISIS  = "#ff5d62"   # real crisis
+# Palette - "deep tank / control room"
+C_BG     = "#081019"
+C_PANEL  = "#0e1d28"
+C_LINE   = "#1d3645"
+C_INK    = "#eaf4f4"
+C_MUTED  = "#7d97a3"
+C_OXY    = "#2bd4c0"   # oxygen cyan -> healthy / clean
+C_VIOLET = "#9b8cff"   # pH series
+C_AMBER  = "#f5b13d"   # hardware fault / maintenance
+C_CRISIS = "#ff5d62"   # real crisis
 
 
 # --------------------------------------------------------------------------- #
-# The agent, as a generator (pure logic, no UI). Mirrors run_pipeline exactly.
+# The farm feed: ONE continuous day, no scenario labels.
+# calm -> a probe slowly fouls (DO looks bad, water fine) -> probe cleaned ->
+# a genuine water crisis (ammonia + pH climb, probe clean) -> calm tail.
 # --------------------------------------------------------------------------- #
-def stream_agent(df: pd.DataFrame, clf, observer: "eng.Observer"):
-    """Yield (i, row, state, event) for every reading.
+def build_farm_feed(seed: int = 7) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    t0 = dt.datetime(2025, 6, 24, 6, 0)
+    rows = []
 
-    state  : one of MONITOR / SUSPECT / INTERROGATE / VERDICT / COOLDOWN
-    event  : None, or a dict describing a completed interrogation + verdict.
-    """
-    cooldown = 0
-    for i in range(len(df)):
-        row = df.iloc[i].to_dict()
-        state, event = "MONITOR", None
+    def push(do, ph, nh4, k):
+        i = len(rows)
+        rows.append({
+            "clock": t0 + dt.timedelta(minutes=i),
+            "DO": round(float(do), 2), "pH": round(float(ph), 2),
+            "NH4_N": round(float(nh4), 2), "Temp": round(26.8 + rng.normal(0, 0.06), 2),
+            "k_value": k,
+        })
 
-        if cooldown > 0:                       # still acting on the last verdict
-            cooldown -= 1
-            state = "COOLDOWN"
-            yield i, row, state, event
-            continue
+    def calm(n, k=0.85):
+        for _ in range(n):
+            push(6.10 + rng.normal(0, 0.06), 7.69 + rng.normal(0, 0.03),
+                 1.00 + rng.normal(0, 0.05), k)
 
-        window = df.iloc[max(0, i - WINDOW + 1): i + 1]
-        is_anom = observer.score_row(window)
-        if is_anom:
-            state = "SUSPECT"
-        escalate = observer.update_debounce(is_anom)
-
-        if escalate:
-            # ---- INTERROGATE: fire the thermal pulse on THIS event ----
-            k = float(row.get("k_value", 0.85))     # swap point for real sensor data
-            curve = eng.get_thermal_curve(k)
-            thermal_verdict, conf, k_est = eng.classify_pulse(clf, curve)
-
-            # ---- VERDICT ----
-            if "HARDWARE FAULT" in thermal_verdict:
-                final = "HARDWARE FAULT (biofouling)"
-                action = "Alarm suppressed - maintenance ticket: clean the DO probe"
-                severity = "suppress"
-                detail = "Probe insulated by biofilm: heat is trapped (low k). The water is fine."
-            else:
-                viol, text, _ = eng.diagnose_water(row)
-                if viol:
-                    final = "REAL WATER CRISIS"
-                    action = "Escalate - activate emergency aeration / intervention"
-                    severity = "crisis"
-                    detail = text
-                else:
-                    final = "Anomaly within SAMAQ limits"
-                    action = "Probe clean, water still safe - keep monitoring"
-                    severity = "clear"
-                    detail = "Sensor verified clean and every parameter is inside the SAMAQ limits."
-
-            eng.log_decision(row, k_est, final, conf)
-            event = {
-                "curve": curve, "k_est": k_est, "conf": conf,
-                "final": final, "action": action, "severity": severity,
-                "detail": detail, "k_input": k,
-            }
-            observer._streak = 0
-            cooldown = COOLDOWN
-            state = "VERDICT"
-
-        yield i, row, state, event
+    calm(110)                                            # 1. normal morning
+    n = 45                                               # 2. biofouling: DO sags, probe FOULED
+    for j in range(n):
+        push(6.10 - (6.10 - 3.30) * (j + 1) / n + rng.normal(0, 0.05),
+             7.69 + rng.normal(0, 0.03), 1.00 + rng.normal(0, 0.05), 0.12)
+    calm(28)                                             # 3. probe cleaned -> back to normal
+    n = 45                                               # 4. real crisis: NH4 + pH climb, probe CLEAN
+    for j in range(n):
+        push(6.05 + rng.normal(0, 0.06),
+             7.69 + (9.80 - 7.69) * (j + 1) / n + rng.normal(0, 0.03),
+             1.00 + (9.00 - 1.00) * (j + 1) / n + rng.normal(0, 0.10), 0.85)
+    calm(22)                                             # 5. resolved tail
+    return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------- #
-# Small UI builders
+# Shared decision logic (used by BOTH tabs) - mirrors run_pipeline exactly
+# --------------------------------------------------------------------------- #
+def evaluate(row: dict, k: float, clf) -> dict:
+    """Fire the thermal pulse on this reading and return the agent's verdict."""
+    curve = eng.get_thermal_curve(k)
+    thermal_verdict, conf, k_est = eng.classify_pulse(clf, curve)
+    viol, text, _ = eng.diagnose_water(row)
+
+    if "HARDWARE FAULT" in thermal_verdict:
+        final = "HARDWARE FAULT (biofouling)"
+        action = "Alarm suppressed - maintenance ticket raised: clean the probe"
+        sev = "suppress"
+        detail = "Probe insulated by biofilm - the heat is trapped (low k). The water itself is fine."
+    elif viol:
+        final = "REAL WATER CRISIS"
+        action = "Escalate - activate emergency aeration / intervention"
+        sev = "crisis"
+        detail = text
+    else:
+        final = "Verified clean - water safe"
+        action = "Probe clean and every parameter within SAMAQ limits - keep monitoring"
+        sev = "clear"
+        detail = "Sensor verified clean and all parameters inside the SAMAQ limits."
+
+    return {"curve": curve, "k_est": k_est, "conf": conf, "final": final,
+            "action": action, "severity": sev, "detail": detail}
+
+
+# --------------------------------------------------------------------------- #
+# Cached models + feed
+# --------------------------------------------------------------------------- #
+@st.cache_resource
+def get_models():
+    eng.init_db()
+    feed = build_farm_feed()
+    obs = eng.Observer()
+    obs.train(feed.iloc[:TRAIN_ROWS])
+    clf = eng.bootstrap_thermal_classifier()
+    return feed, obs, clf
+
+
+# --------------------------------------------------------------------------- #
+# CSS
 # --------------------------------------------------------------------------- #
 def inject_css():
-    st.markdown(
-        f"""
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
+    st.markdown(f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
+    .stApp {{ background: radial-gradient(1200px 600px at 72% -12%, #0c2230 0%, {C_BG} 55%); }}
+    .block-container {{ padding-top: 1.4rem; max-width: 1180px; }}
+    html, body, [class*="css"] {{ font-family:'Inter',sans-serif; color:{C_INK}; }}
+    h1,h2,h3,h4 {{ font-family:'Sora',sans-serif; letter-spacing:-.01em; }}
 
-        .stApp {{ background: radial-gradient(1200px 600px at 70% -10%, #0c2230 0%, {C_BG} 55%); }}
-        .block-container {{ padding-top: 1.6rem; max-width: 1200px; }}
-        html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; color: {C_INK}; }}
-        h1, h2, h3 {{ font-family: 'Sora', sans-serif; letter-spacing: -0.01em; }}
+    .hdr {{ display:flex; align-items:center; justify-content:space-between;
+            border-bottom:1px solid {C_LINE}; padding-bottom:.7rem; margin-bottom:.4rem; }}
+    .hdr .title {{ font-family:'Sora'; font-weight:700; font-size:1.5rem; }}
+    .hdr .title small {{ color:{C_OXY}; font-weight:600; }}
+    .hdr .sub {{ color:{C_MUTED}; font-size:.8rem; font-family:'JetBrains Mono'; }}
+    .simbadge {{ font-family:'JetBrains Mono'; font-size:.7rem; color:{C_AMBER};
+                 border:1px solid {C_AMBER}55; border-radius:999px; padding:.26rem .7rem;
+                 background:{C_AMBER}12; white-space:nowrap; }}
 
-        /* header */
-        .hdr {{ display:flex; align-items:center; justify-content:space-between;
-               border-bottom:1px solid {C_LINE}; padding-bottom:.7rem; margin-bottom:1.1rem; }}
-        .hdr .title {{ font-family:'Sora'; font-weight:700; font-size:1.55rem; }}
-        .hdr .title small {{ color:{C_OXY}; font-weight:600; }}
-        .hdr .sub {{ color:{C_MUTED}; font-size:.82rem; font-family:'JetBrains Mono'; }}
-        .simbadge {{ font-family:'JetBrains Mono'; font-size:.72rem; color:{C_AMBER};
-                    border:1px solid {C_AMBER}55; border-radius:999px; padding:.28rem .7rem;
-                    background:{C_AMBER}12; white-space:nowrap; }}
+    .statusbar {{ display:flex; gap:1.4rem; align-items:center; color:{C_MUTED};
+                  font-family:'JetBrains Mono'; font-size:.78rem; margin:.5rem 0 1rem; }}
+    .statusbar b {{ color:{C_INK}; }}
+    .clock {{ color:{C_OXY}; font-weight:600; }}
 
-        /* state machine chips */
-        .chips {{ display:flex; gap:.4rem; flex-wrap:wrap; margin:.2rem 0 1rem; }}
-        .chip {{ font-family:'JetBrains Mono'; font-size:.72rem; letter-spacing:.06em;
-                color:{C_MUTED}; border:1px solid {C_LINE}; border-radius:6px;
-                padding:.3rem .6rem; background:{C_PANEL}; transition:all .15s; }}
-        .chip.on {{ color:{C_BG}; background:{C_OXY}; border-color:{C_OXY}; font-weight:600; }}
-        .chip.on.amber  {{ background:{C_AMBER}; border-color:{C_AMBER}; }}
-        .chip.on.crisis {{ background:{C_CRISIS}; border-color:{C_CRISIS}; color:{C_INK}; }}
+    .chips {{ display:flex; gap:.4rem; flex-wrap:wrap; margin:.1rem 0 1rem; }}
+    .chip {{ font-family:'JetBrains Mono'; font-size:.7rem; letter-spacing:.06em; color:{C_MUTED};
+             border:1px solid {C_LINE}; border-radius:6px; padding:.3rem .6rem; background:{C_PANEL}; }}
+    .chip.on {{ color:{C_BG}; background:{C_OXY}; border-color:{C_OXY}; font-weight:600; }}
+    .chip.on.amber  {{ background:{C_AMBER}; border-color:{C_AMBER}; }}
+    .chip.on.crisis {{ background:{C_CRISIS}; border-color:{C_CRISIS}; color:{C_INK}; }}
 
-        /* verdict banner */
-        .banner {{ border-radius:14px; padding:1.2rem 1.4rem; margin-bottom:1.1rem;
-                  border:1px solid {C_LINE}; background:{C_PANEL};
-                  display:flex; align-items:center; gap:1rem; }}
-        .banner .dot {{ width:14px; height:14px; border-radius:50%; flex:none;
-                       box-shadow:0 0 0 6px #ffffff10; }}
-        .banner .v {{ font-family:'Sora'; font-weight:700; font-size:1.3rem; line-height:1.1; }}
-        .banner .a {{ color:{C_MUTED}; font-size:.9rem; margin-top:.15rem; }}
-        .banner.clear   {{ border-color:{C_OXY}55;   background:linear-gradient(90deg,{C_OXY}14,transparent); }}
-        .banner.clear   .dot {{ background:{C_OXY}; }}
-        .banner.suppress{{ border-color:{C_AMBER}66; background:linear-gradient(90deg,{C_AMBER}16,transparent); }}
-        .banner.suppress .dot {{ background:{C_AMBER}; }}
-        .banner.crisis  {{ border-color:{C_CRISIS}77; background:linear-gradient(90deg,{C_CRISIS}1c,transparent); }}
-        .banner.crisis  .dot {{ background:{C_CRISIS}; animation:pulse 1s infinite; }}
-        @keyframes pulse {{ 0%{{box-shadow:0 0 0 0 {C_CRISIS}66;}} 100%{{box-shadow:0 0 0 12px {C_CRISIS}00;}} }}
+    .banner {{ border-radius:14px; padding:1.15rem 1.35rem; margin-bottom:1.05rem;
+               border:1px solid {C_LINE}; background:{C_PANEL}; display:flex; align-items:center; gap:1rem; }}
+    .banner .dot {{ width:14px; height:14px; border-radius:50%; flex:none; box-shadow:0 0 0 6px #ffffff10; }}
+    .banner .v {{ font-family:'Sora'; font-weight:700; font-size:1.25rem; line-height:1.1; }}
+    .banner .a {{ color:{C_MUTED}; font-size:.88rem; margin-top:.15rem; }}
+    .banner.clear    {{ border-color:{C_OXY}55;   background:linear-gradient(90deg,{C_OXY}14,transparent); }}
+    .banner.clear .dot {{ background:{C_OXY}; }}
+    .banner.suppress {{ border-color:{C_AMBER}66; background:linear-gradient(90deg,{C_AMBER}16,transparent); }}
+    .banner.suppress .dot {{ background:{C_AMBER}; }}
+    .banner.crisis   {{ border-color:{C_CRISIS}77; background:linear-gradient(90deg,{C_CRISIS}1c,transparent); }}
+    .banner.crisis .dot {{ background:{C_CRISIS}; animation:pulse 1s infinite; }}
+    .banner.busy {{ border-color:{C_VIOLET}66; background:linear-gradient(90deg,{C_VIOLET}16,transparent); }}
+    .banner.busy .dot {{ background:{C_VIOLET}; animation:pulse 1s infinite; }}
+    @keyframes pulse {{ 0%{{box-shadow:0 0 0 0 {C_CRISIS}66;}} 100%{{box-shadow:0 0 0 12px {C_CRISIS}00;}} }}
 
-        /* metric cards */
-        .cards {{ display:grid; grid-template-columns:repeat(4,1fr); gap:.7rem; margin-bottom:1.1rem; }}
-        .card {{ background:{C_PANEL}; border:1px solid {C_LINE}; border-radius:12px; padding:.8rem .9rem; }}
-        .card .lab {{ color:{C_MUTED}; font-size:.72rem; font-family:'JetBrains Mono'; letter-spacing:.05em; }}
-        .card .val {{ font-family:'JetBrains Mono'; font-weight:600; font-size:1.55rem; margin-top:.15rem; }}
-        .card .lim {{ font-size:.7rem; color:{C_MUTED}; margin-top:.1rem; }}
-        .card.ok   {{ }}
-        .card.bad  {{ border-color:{C_CRISIS}88; }}
-        .card.bad .val {{ color:{C_CRISIS}; }}
+    .cards {{ display:grid; grid-template-columns:repeat(4,1fr); gap:.7rem; margin-bottom:1.05rem; }}
+    .card {{ background:{C_PANEL}; border:1px solid {C_LINE}; border-radius:12px; padding:.8rem .9rem; }}
+    .card .lab {{ color:{C_MUTED}; font-size:.7rem; font-family:'JetBrains Mono'; letter-spacing:.05em; }}
+    .card .val {{ font-family:'JetBrains Mono'; font-weight:600; font-size:1.5rem; margin-top:.12rem; }}
+    .card .lim {{ font-size:.68rem; color:{C_MUTED}; margin-top:.1rem; }}
+    .card.bad {{ border-color:{C_CRISIS}88; }}
+    .card.bad .val {{ color:{C_CRISIS}; }}
 
-        /* panels */
-        .panel {{ background:{C_PANEL}; border:1px solid {C_LINE}; border-radius:12px; padding:1rem 1.1rem; }}
-        .panel h4 {{ font-family:'Sora'; font-size:.95rem; margin:0 0 .2rem; }}
-        .panel .note {{ color:{C_MUTED}; font-size:.74rem; font-family:'JetBrains Mono'; }}
-        .kbig {{ font-family:'JetBrains Mono'; font-size:2rem; font-weight:600; }}
+    .panel {{ background:{C_PANEL}; border:1px solid {C_LINE}; border-radius:12px; padding:1rem 1.1rem; }}
+    .panel h4 {{ font-family:'Sora'; font-size:.92rem; margin:0 0 .25rem; }}
+    .panel .note {{ color:{C_MUTED}; font-size:.73rem; font-family:'JetBrains Mono'; }}
+    .kbig {{ font-family:'JetBrains Mono'; font-size:2rem; font-weight:600; }}
 
-        section[data-testid="stSidebar"] {{ background:{C_PANEL}; border-right:1px solid {C_LINE}; }}
-        .stButton>button {{ font-family:'Sora'; font-weight:600; border-radius:10px;
-                           border:1px solid {C_OXY}; background:{C_OXY}; color:{C_BG}; }}
-        .stButton>button:hover {{ background:{C_OXY}dd; color:{C_BG}; }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    section[data-testid="stSidebar"] {{ background:{C_PANEL}; border-right:1px solid {C_LINE}; }}
+    .stButton>button {{ font-family:'Sora'; font-weight:600; border-radius:10px;
+                        border:1px solid {C_OXY}; background:{C_OXY}; color:{C_BG}; }}
+    .stButton>button:hover {{ background:{C_OXY}dd; color:{C_BG}; }}
+    </style>""", unsafe_allow_html=True)
 
 
+# --------------------------------------------------------------------------- #
+# HTML builders
+# --------------------------------------------------------------------------- #
 STATES = ["MONITOR", "SUSPECT", "INTERROGATE", "VERDICT"]
 
 
-def chips_html(active: str, severity: str | None) -> str:
+def chips_html(active: str, severity=None) -> str:
     cls = {"suppress": "amber", "crisis": "crisis"}.get(severity or "", "")
-    shown = "INTERROGATE" if active == "VERDICT" else active
     out = ['<div class="chips">']
     for s in STATES:
-        on = "on" if s == shown or (active == "VERDICT" and s in ("INTERROGATE", "VERDICT")) else ""
+        on = "on" if (s == active or (active == "VERDICT" and s in ("INTERROGATE", "VERDICT"))) else ""
         extra = cls if (on and s == "VERDICT") else ""
         out.append(f'<div class="chip {on} {extra}">{s}</div>')
     out.append("</div>")
@@ -210,209 +221,265 @@ def chips_html(active: str, severity: str | None) -> str:
 
 def cards_html(row: dict) -> str:
     do, ph, nh4, temp = row["DO"], row["pH"], row["NH4_N"], row["Temp"]
-    do_bad  = do  < eng.SAMAQ["DO_MIN"]
-    ph_bad  = ph  < eng.SAMAQ["PH_MIN"] or ph > eng.SAMAQ["PH_MAX"]
-    nh4_bad = nh4 > eng.SAMAQ["NH4_MAX"]
-    tp_bad  = temp < eng.TEMP_COMFORT["TEMP_MIN"] or temp > eng.TEMP_COMFORT["TEMP_MAX"]
+    bad = {
+        "do":  do < eng.SAMAQ["DO_MIN"],
+        "ph":  ph < eng.SAMAQ["PH_MIN"] or ph > eng.SAMAQ["PH_MAX"],
+        "nh4": nh4 > eng.SAMAQ["NH4_MAX"],
+        "tp":  temp < eng.TEMP_COMFORT["TEMP_MIN"] or temp > eng.TEMP_COMFORT["TEMP_MAX"],
+    }
 
-    def card(lab, val, unit, lim, bad):
-        return (f'<div class="card {"bad" if bad else "ok"}">'
-                f'<div class="lab">{lab}</div>'
-                f'<div class="val">{val:.2f}<span style="font-size:.8rem;color:{C_MUTED}"> {unit}</span></div>'
+    def card(lab, val, unit, lim, b):
+        return (f'<div class="card {"bad" if b else ""}"><div class="lab">{lab}</div>'
+                f'<div class="val">{val:.2f}<span style="font-size:.78rem;color:{C_MUTED}"> {unit}</span></div>'
                 f'<div class="lim">{lim}</div></div>')
 
     return ('<div class="cards">'
-            + card("DISSOLVED O\u2082", do, "mg/L", f"SAMAQ min {eng.SAMAQ['DO_MIN']}", do_bad)
-            + card("pH", ph, "", f"SAMAQ {eng.SAMAQ['PH_MIN']}\u2013{eng.SAMAQ['PH_MAX']}", ph_bad)
-            + card("AMMONIA (NH\u2084)", nh4, "mg/L", f"SAMAQ max {eng.SAMAQ['NH4_MAX']}", nh4_bad)
-            + card("TEMP", temp, "\u00b0C", "tilapia band 22\u201332", tp_bad)
+            + card("DISSOLVED O\u2082", do, "mg/L", f"SAMAQ min {eng.SAMAQ['DO_MIN']}", bad["do"])
+            + card("pH", ph, "", f"SAMAQ {eng.SAMAQ['PH_MIN']}\u2013{eng.SAMAQ['PH_MAX']}", bad["ph"])
+            + card("AMMONIA (NH\u2084)", nh4, "mg/L", f"SAMAQ max {eng.SAMAQ['NH4_MAX']}", bad["nh4"])
+            + card("TEMP", temp, "\u00b0C", "tilapia 22\u201332", bad["tp"])
             + "</div>")
 
 
-def banner_html(event: dict | None) -> str:
+def banner_html(event, busy=False) -> str:
+    if busy:
+        return ('<div class="banner busy"><div class="dot"></div><div>'
+                '<div class="v">Interrogating probe\u2026</div>'
+                '<div class="a">Firing thermal pulse and reading the 30-second cooling curve.</div>'
+                "</div></div>")
     if event is None:
         return ('<div class="banner clear"><div class="dot"></div><div>'
-                f'<div class="v">Monitoring \u2014 water trusted</div>'
-                f'<div class="a">No persistent anomaly. The agent is watching rate-of-change, not just raw values.</div>'
+                '<div class="v">Monitoring \u2014 water trusted</div>'
+                '<div class="a">No persistent anomaly. The agent watches rate-of-change, not just raw values.</div>'
                 "</div></div>")
-    sev = event["severity"]
-    cls = {"clear": "clear", "suppress": "suppress", "crisis": "crisis"}[sev]
+    cls = event["severity"]
     return (f'<div class="banner {cls}"><div class="dot"></div><div>'
             f'<div class="v">{event["final"]}</div>'
             f'<div class="a">{event["action"]} \u00b7 {event["detail"]}</div>'
             "</div></div>")
 
 
+def thermal_idle_html() -> str:
+    return ('<div class="panel"><h4>Probe idle</h4>'
+            '<p class="note">No pulse running. The cooling constant k is only measured during an '
+            'interrogation \u2014 it stays blank while the water is trusted.</p></div>')
+
+
+def thermal_busy_html() -> str:
+    return (f'<div class="panel"><h4>Pulsing\u2026</h4>'
+            f'<div class="kbig" style="color:{C_VIOLET}">k = \u2014</div>'
+            f'<p class="note">heating thermistor +5\u00b0C \u00b7 sampling 10 Hz \u00b7 SIMULATION MODE</p></div>')
+
+
+def thermal_result_html(event, when="") -> str:
+    col = C_AMBER if event["severity"] == "suppress" else C_OXY
+    stamp = f' \u00b7 {when}' if when else ""
+    return (f'<div class="panel"><h4>Probe interrogated{stamp}</h4>'
+            f'<div class="kbig" style="color:{col}">k = {event["k_est"]:.2f}</div>'
+            f'<p class="note">cooling constant \u00b7 confidence {event["conf"]:.0%} \u00b7 SIMULATION MODE</p></div>')
+
+
 def param_chart(hist: pd.DataFrame):
-    """Recent trace of the three parameters that move, with the SAMAQ limit lines."""
     long = hist.melt("t", value_vars=["DO", "pH", "NH4_N"], var_name="param", value_name="val")
     color = alt.Color("param:N",
-                      scale=alt.Scale(domain=["DO", "pH", "NH4_N"],
-                                      range=[C_OXY, C_VIOLET, C_AMBER]),
+                      scale=alt.Scale(domain=["DO", "pH", "NH4_N"], range=[C_OXY, C_VIOLET, C_AMBER]),
                       legend=alt.Legend(orient="top", title=None))
     line = (alt.Chart(long).mark_line(strokeWidth=2)
             .encode(x=alt.X("t:Q", title=None, axis=alt.Axis(labels=False, ticks=False)),
-                    y=alt.Y("val:Q", title="mg/L  /  pH",
-                            scale=alt.Scale(domain=[0, 11])),
+                    y=alt.Y("val:Q", title="mg/L  /  pH", scale=alt.Scale(domain=[0, 11])),
                     color=color))
-    rules = pd.DataFrame({"y": [eng.SAMAQ["DO_MIN"], eng.SAMAQ["PH_MAX"]],
-                          "lab": ["SAMAQ 5.0  (DO floor / NH\u2084 ceiling)", "pH ceiling 9.5"]})
-    rule = (alt.Chart(rules).mark_rule(color=C_CRISIS, strokeDash=[4, 4], opacity=.7)
-            .encode(y="y:Q"))
+    rules = pd.DataFrame({"y": [eng.SAMAQ["DO_MIN"], eng.SAMAQ["PH_MAX"]]})
+    rule = alt.Chart(rules).mark_rule(color=C_CRISIS, strokeDash=[4, 4], opacity=.7).encode(y="y:Q")
     return (line + rule).properties(height=240, background="transparent").configure_view(
         strokeWidth=0).configure_axis(grid=True, gridColor=C_LINE, gridOpacity=.4,
                                       labelColor=C_MUTED, titleColor=C_MUTED)
 
 
 def thermal_chart(curve: np.ndarray, severity: str):
-    col = {"suppress": C_AMBER, "crisis": C_OXY, "clear": C_OXY}[severity]
-    t = np.linspace(0, 3, len(curve))
+    col = C_AMBER if severity == "suppress" else C_OXY
+    t = np.linspace(0, 30, len(curve))
     d = pd.DataFrame({"t": t, "temp": curve})
-    area = (alt.Chart(d).mark_area(opacity=.18, color=col)
-            .encode(x=alt.X("t:Q", title="seconds"), y=alt.Y("temp:Q", title="\u0394T \u00b0C")))
-    line = (alt.Chart(d).mark_line(strokeWidth=2.5, color=col)
-            .encode(x="t:Q", y="temp:Q"))
+    area = alt.Chart(d).mark_area(opacity=.18, color=col).encode(
+        x=alt.X("t:Q", title="seconds"), y=alt.Y("temp:Q", title="\u0394T \u00b0C"))
+    line = alt.Chart(d).mark_line(strokeWidth=2.5, color=col).encode(x="t:Q", y="temp:Q")
     return (area + line).properties(height=200, background="transparent").configure_view(
         strokeWidth=0).configure_axis(grid=True, gridColor=C_LINE, gridOpacity=.4,
                                       labelColor=C_MUTED, titleColor=C_MUTED)
 
 
 # --------------------------------------------------------------------------- #
-# Main app
+# TAB 1 - live monitor
+# --------------------------------------------------------------------------- #
+def tab_live(feed, obs, clf):
+    speed = st.select_slider("Demo playback speed", options=["Slow", "Normal", "Fast"], value="Normal")
+    pace = {"Slow": 0.22, "Normal": 0.11, "Fast": 0.04}[speed]
+    c1, c2 = st.columns([1, 4])
+    start = c1.button("\u25B6  Start live feed", use_container_width=True)
+    c2.caption("One continuous tank feed \u00b7 1 reading = 1 minute of farm time. "
+               "The agent decides on its own \u2014 there are no scenario labels.")
+
+    clock_ph  = st.empty()
+    chips_ph  = st.empty()
+    banner_ph = st.empty()
+    cards_ph  = st.empty()
+    colL, colR = st.columns([1.35, 1])
+    with colL:
+        st.markdown("##### Live water parameters")
+        chart_ph = st.empty()
+    with colR:
+        st.markdown("##### Thermal interrogation")
+        thermal_head_ph  = st.empty()
+        thermal_chart_ph = st.empty()
+    st.markdown("##### Offline decision log  \u00b7  edge_telemetry.db")
+    log_ph = st.empty()
+
+    def status(row, state):
+        clock_ph.markdown(
+            f'<div class="statusbar"><span class="clock">\u25CF FARM TIME {row["clock"].strftime("%H:%M")}</span>'
+            f'<span>state <b>{state}</b></span><span>1 reading / min</span></div>',
+            unsafe_allow_html=True)
+
+    # idle first render
+    first = feed.iloc[0].to_dict()
+    status(first, "MONITOR")
+    chips_ph.markdown(chips_html("MONITOR"), unsafe_allow_html=True)
+    banner_ph.markdown(banner_html(None), unsafe_allow_html=True)
+    cards_ph.markdown(cards_html(first), unsafe_allow_html=True)
+    thermal_head_ph.markdown(thermal_idle_html(), unsafe_allow_html=True)
+
+    if not start:
+        st.info("Press **Start live feed** to watch the tank in real time.")
+        return
+
+    # fresh run
+    conn = sqlite3.connect(eng.DB_PATH); conn.execute("DELETE FROM verified_logs"); conn.commit(); conn.close()
+    obs._streak = 0
+    cooldown = 0
+    hist, last_event = [], None
+    progress = st.progress(0.0)
+
+    for i in range(len(feed)):
+        row = feed.iloc[i].to_dict()
+        hist.append({"t": i, "DO": row["DO"], "pH": row["pH"], "NH4_N": row["NH4_N"]})
+        state, fired = "MONITOR", None
+
+        if cooldown > 0:
+            cooldown -= 1
+            state = "COOLDOWN"
+        else:
+            window = feed.iloc[max(0, i - WINDOW + 1): i + 1]
+            is_anom = obs.score_row(window) if i > 0 else False
+            if is_anom:
+                state = "SUSPECT"
+            if obs.update_debounce(is_anom):
+                # ---- visible INTERROGATE beat (the ~30s pulse) ----
+                state = "INTERROGATE"
+                status(row, state)
+                chips_ph.markdown(chips_html("INTERROGATE"), unsafe_allow_html=True)
+                banner_ph.markdown(banner_html(None, busy=True), unsafe_allow_html=True)
+                cards_ph.markdown(cards_html(row), unsafe_allow_html=True)
+                thermal_head_ph.markdown(thermal_busy_html(), unsafe_allow_html=True)
+                time.sleep(1.3)
+                # ---- verdict ----
+                fired = evaluate(row, float(row.get("k_value", 0.85)), clf)
+                eng.log_decision(row, fired["k_est"], fired["final"], fired["conf"])
+                last_event = fired
+                obs._streak = 0
+                cooldown = COOLDOWN_LIVE
+                state = "VERDICT"
+
+        # render this frame
+        status(row, state)
+        chips_ph.markdown(chips_html(state, last_event["severity"] if (state in ("VERDICT",) and last_event) else None),
+                          unsafe_allow_html=True)
+        cards_ph.markdown(cards_html(row), unsafe_allow_html=True)
+        chart_ph.altair_chart(param_chart(pd.DataFrame(hist).tail(240)), use_container_width=True)
+
+        if fired is not None:                                   # just reached a verdict
+            banner_ph.markdown(banner_html(fired), unsafe_allow_html=True)
+            thermal_head_ph.markdown(thermal_result_html(fired, row["clock"].strftime("%H:%M")),
+                                     unsafe_allow_html=True)
+            thermal_chart_ph.altair_chart(thermal_chart(fired["curve"], fired["severity"]),
+                                          use_container_width=True)
+            log_ph.dataframe(eng.fetch_logs(8), use_container_width=True, hide_index=True)
+            time.sleep(2.0)                                     # hold so it's readable
+        elif state == "COOLDOWN":
+            banner_ph.markdown(banner_html(last_event), unsafe_allow_html=True)
+            time.sleep(pace)
+        else:                                                   # MONITOR / SUSPECT -> k blank
+            banner_ph.markdown(banner_html(None), unsafe_allow_html=True)
+            thermal_head_ph.markdown(thermal_idle_html(), unsafe_allow_html=True)
+            time.sleep(pace)
+
+        progress.progress((i + 1) / len(feed))
+
+    log_ph.dataframe(eng.fetch_logs(12), use_container_width=True, hide_index=True)
+    st.success("Feed complete \u2014 every decision was logged offline first, then would sync to the cloud.")
+
+
+# --------------------------------------------------------------------------- #
+# TAB 2 - manual test console
+# --------------------------------------------------------------------------- #
+def tab_manual(clf):
+    st.caption("Enter any water values and the agent will diagnose them and run a thermal "
+               "interrogation on the spot. Use it to probe edge cases.")
+    a, b, c, d = st.columns(4)
+    do  = a.number_input("Dissolved O\u2082 (mg/L)", 0.0, 20.0, 6.10, 0.1)
+    ph  = b.number_input("pH", 0.0, 14.0, 7.70, 0.1)
+    nh4 = c.number_input("Ammonia NH\u2084 (mg/L)", 0.0, 50.0, 1.00, 0.1)
+    temp = d.number_input("Temp (\u00b0C)", 0.0, 45.0, 26.8, 0.1)
+
+    probe = st.radio("Probe condition (what the thermal pulse would find)",
+                     ["Clean probe (sheds heat fast)", "Fouled probe (traps heat)"], horizontal=True)
+    st.caption("In the deployed product the pulse measures this automatically off a real sonde; "
+               "offline you state it so you can test the key insight.")
+
+    run = st.button("Run diagnostic", use_container_width=False)
+
+    out = st.empty()
+    if run:
+        k = 0.85 if probe.startswith("Clean") else 0.12
+        row = {"TIME": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+               "DO": do, "pH": ph, "NH4_N": nh4, "Temp": temp}
+        ev = evaluate(row, k, clf)
+        eng.log_decision(row, ev["k_est"], ev["final"], ev["conf"])
+
+        st.markdown(cards_html(row), unsafe_allow_html=True)
+        st.markdown(banner_html(ev), unsafe_allow_html=True)
+        g1, g2 = st.columns([1.3, 1])
+        with g1:
+            st.altair_chart(thermal_chart(ev["curve"], ev["severity"]), use_container_width=True)
+            st.caption("30-second cooling curve from the interrogation pulse.")
+        with g2:
+            st.markdown(thermal_result_html(ev), unsafe_allow_html=True)
+
+    st.markdown("##### Offline decision log  \u00b7  edge_telemetry.db")
+    try:
+        st.dataframe(eng.fetch_logs(12), use_container_width=True, hide_index=True)
+    except Exception:
+        st.info("No decisions logged yet.")
+
+
+# --------------------------------------------------------------------------- #
+# Main
 # --------------------------------------------------------------------------- #
 def main():
     st.set_page_config(page_title="RAS Sentinel", page_icon="\U0001F41F", layout="wide")
     inject_css()
+    feed, obs, clf = get_models()
 
     st.markdown(
-        '<div class="hdr">'
-        '<div><div class="title">RAS&nbsp;<small>SENTINEL</small></div>'
-        '<div class="sub">edge AI gateway \u00b7 verify before you alarm</div></div>'
+        '<div class="hdr"><div>'
+        '<div class="title">RAS&nbsp;<small>SENTINEL</small></div>'
+        f'<div class="sub">{FARM} \u00b7 {TANK} \u00b7 verify before you alarm</div></div>'
         '<div class="simbadge">\u25CF THERMAL LAYER: SIMULATION / DIGITAL-TWIN \u2014 field calibration pending</div>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+        '</div>', unsafe_allow_html=True)
 
-    # ---- sidebar controls ----
-    with st.sidebar:
-        st.markdown("### Scenario")
-        scenario_label = st.radio("scenario", list(SCENARIOS.keys()), label_visibility="collapsed")
-        path = SCENARIOS[scenario_label]
-        speed = st.slider("Playback speed (sec / frame)", 0.0, 0.25, 0.05, 0.01)
-        ff_calm = st.checkbox("Fast-forward calm baseline", value=True)
-        clear_log = st.checkbox("Clear log before run", value=True)
-        run = st.button("\u25B6  Run scenario", use_container_width=True)
-        st.markdown(
-            f'<p class="note" style="margin-top:1rem">The agent never sees the scenario label '
-            f'or the <code>is_injected</code> tag \u2014 it decides only from the readings.</p>',
-            unsafe_allow_html=True)
-
-    # ---- placeholders (updated in place during playback) ----
-    chips_ph   = st.empty()
-    banner_ph  = st.empty()
-    cards_ph   = st.empty()
-    col_l, col_r = st.columns([1.35, 1])
-    with col_l:
-        st.markdown("##### Live water parameters")
-        chart_ph = st.empty()
-    with col_r:
-        st.markdown("##### Thermal interrogation")
-        thermal_head_ph = st.empty()
-        thermal_chart_ph = st.empty()
-    st.markdown("##### Offline decision log  ·  edge_telemetry.db")
-    log_ph = st.empty()
-
-    # ---- initial idle render ----
-    chips_ph.markdown(chips_html("MONITOR", None), unsafe_allow_html=True)
-    banner_ph.markdown(banner_html(None), unsafe_allow_html=True)
-    thermal_head_ph.markdown(
-        '<div class="panel"><h4>Standing by</h4>'
-        '<p class="note">No interrogation yet. When the Observer suspects a problem, the agent '
-        'pulses the probe\u2019s thermistor and reads the cooling curve here.</p></div>',
-        unsafe_allow_html=True)
-
-    if not run:
-        try:
-            df0 = pd.read_csv(path)
-            cards_ph.markdown(cards_html(df0.iloc[0].to_dict()), unsafe_allow_html=True)
-        except FileNotFoundError:
-            st.error(f"Could not find {path}. Run generate_datasets.py first, and keep this "
-                     f"file next to the CSVs and ras_sentinel_engine.py.")
-        st.info("Pick a scenario on the left and press **Run scenario**.")
-        return
-
-    # ---- load + prepare ----
-    try:
-        df = pd.read_csv(path)
-    except FileNotFoundError:
-        st.error(f"Could not find {path}. Run generate_datasets.py first.")
-        return
-
-    eng.init_db()
-    if clear_log:
-        conn = sqlite3.connect(eng.DB_PATH)
-        conn.execute("DELETE FROM verified_logs")
-        conn.commit(); conn.close()
-
-    clf = eng.bootstrap_thermal_classifier()
-    obs = eng.Observer()
-    obs.train(df.iloc[:eng.BASELINE_ROWS])
-
-    # pacing: skip through the calm baseline, slow down in the fault region
-    if "is_injected" in df.columns and (df["is_injected"] == 1).any():
-        fault_start = int(df.index[df["is_injected"] == 1][0])
-    else:
-        fault_start = len(df)
-    calm_every = max(1, fault_start // 12)                       # ~12 calm frames
-    live_every = max(1, (len(df) - fault_start) // 160)          # ~160 live frames
-
-    hist_rows = []
-    last_event = None
-    last_sev = None
-    progress = st.sidebar.progress(0.0)
-
-    for i, row, state, event in stream_agent(df, clf, obs):
-        hist_rows.append({"t": i, "DO": row["DO"], "pH": row["pH"], "NH4_N": row["NH4_N"]})
-        if event is not None:
-            last_event, last_sev = event, event["severity"]
-
-        in_calm = i < fault_start
-        render = (event is not None) or (i == len(df) - 1) \
-            or (i % (calm_every if (in_calm and ff_calm) else live_every) == 0)
-        if not render:
-            continue
-
-        # update the four live regions
-        chips_ph.markdown(chips_html(state, last_sev), unsafe_allow_html=True)
-        cards_ph.markdown(cards_html(row), unsafe_allow_html=True)
-        if last_event is not None:
-            banner_ph.markdown(banner_html(last_event), unsafe_allow_html=True)
-
-        hist = pd.DataFrame(hist_rows).tail(240)
-        chart_ph.altair_chart(param_chart(hist), use_container_width=True)
-
-        if event is not None:
-            thermal_head_ph.markdown(
-                f'<div class="panel"><h4>Probe interrogated</h4>'
-                f'<div class="kbig" style="color:{C_OXY if event["severity"]!="suppress" else C_AMBER}">'
-                f'k = {event["k_est"]:.2f}</div>'
-                f'<p class="note">cooling constant \u00b7 confidence {event["conf"]:.0%} '
-                f'\u00b7 SIMULATION MODE</p></div>',
-                unsafe_allow_html=True)
-            thermal_chart_ph.altair_chart(thermal_chart(event["curve"], event["severity"]),
-                                          use_container_width=True)
-            log_ph.dataframe(eng.fetch_logs(8), use_container_width=True, hide_index=True)
-            time.sleep(max(speed, 0.05) + 0.9)     # let judges read the verdict
-        else:
-            time.sleep(speed)
-
-        progress.progress(min(1.0, (i + 1) / len(df)))
-
-    progress.progress(1.0)
-    # final log table
-    log_ph.dataframe(eng.fetch_logs(12), use_container_width=True, hide_index=True)
-    st.success("Scenario complete \u2014 every decision above was logged offline first, "
-               "then would sync to the cloud. That is the edge-to-cloud story.")
+    live, manual = st.tabs(["  Live monitor  ", "  Manual test console  "])
+    with live:
+        tab_live(feed, obs, clf)
+    with manual:
+        tab_manual(clf)
 
 
 if __name__ == "__main__":
